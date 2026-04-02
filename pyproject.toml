@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "celery-saga"
+version = "0.1.0"
+description = "Saga pattern for Celery with automatic compensation"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["celery", "saga", "distributed", "transactions", "compensation", "workflow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: Celery",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "celery>=5.3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kowalski/celery-saga"
+Repository = "https://github.com/kowalski/celery-saga"
+Issues = "https://github.com/kowalski/celery-saga/issues"
+
+[project.optional-dependencies]
+redis = ["redis>=4.0.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-celery>=0.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["celery_saga*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
