@@ -23,3 +23,7 @@ class SagaBackend(ABC):
     @abstractmethod
     def find_by_idempotency_key(self, key: str) -> SagaExecution | None:
         ...
+
+    def list_all(self) -> list[SagaExecution]:
+        """List all saga executions. Override for efficient backend-specific implementation."""
+        return []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from celery import shared_task, current_app, group, chain, chord
@@ -207,6 +208,7 @@ def saga_run_step(self, saga_id: str, step_index: int):
 
     # Mark step as running
     step_exec.status = StepStatus.RUNNING
+    step_exec.started_at = datetime.now(timezone.utc).isoformat()
     step_exec.task_id = self.request.id
     execution.touch()
     backend.save(execution)
@@ -246,6 +248,7 @@ def saga_run_step(self, saga_id: str, step_index: int):
 
         # Update step
         step_exec.status = StepStatus.SUCCESS
+        step_exec.completed_at = datetime.now(timezone.utc).isoformat()
         step_exec.output = output if isinstance(output, dict) else {"result": output}
         step_exec.compensation_data = compensation_data
 
@@ -259,6 +262,7 @@ def saga_run_step(self, saga_id: str, step_index: int):
 
     except PermanentFailure as e:
         step_exec.status = StepStatus.FAILED
+        step_exec.completed_at = datetime.now(timezone.utc).isoformat()
         step_exec.error = str(e)
         step_exec.compensation_data = e.compensation_data
         execution.touch()
@@ -268,6 +272,7 @@ def saga_run_step(self, saga_id: str, step_index: int):
 
     except Exception as e:
         step_exec.status = StepStatus.FAILED
+        step_exec.completed_at = datetime.now(timezone.utc).isoformat()
         step_exec.error = str(e)
         execution.touch()
         backend.save(execution)

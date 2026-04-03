@@ -38,6 +38,8 @@ class StepExecution:
     no_compensation: bool = False
     error: str | None = None
     parallel_group: int | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -52,6 +54,8 @@ class StepExecution:
             "no_compensation": self.no_compensation,
             "error": self.error,
             "parallel_group": self.parallel_group,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
         }
 
     @classmethod

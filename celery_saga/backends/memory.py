@@ -29,3 +29,6 @@ class MemorySagaBackend(SagaBackend):
         if saga_id is None:
             return None
         return self.load(saga_id)
+
+    def list_all(self) -> list[SagaExecution]:
+        return list(self._store.values())

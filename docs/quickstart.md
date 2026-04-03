@@ -38,11 +38,10 @@ set_default_backend(RedisSagaBackend(url="redis://localhost:6379/1"))
 ```python
 # tasks.py
 from app import app
-from celery_saga import saga_step, StepResponse
+from celery_saga import saga_task, StepResponse
 
 
-@saga_step(compensate="tasks.refund_payment")
-@app.task
+@saga_task(app, compensate="tasks.refund_payment")
 def charge_payment(**kwargs):
     order_id = kwargs["order_id"]
     amount = kwargs["amount"]
@@ -60,8 +59,7 @@ def refund_payment(compensation_data):
     print(f"Refunded {compensation_data['amount']} for {compensation_data['transaction_id']}")
 
 
-@saga_step(compensate="tasks.release_inventory")
-@app.task
+@saga_task(app, compensate="tasks.release_inventory")
 def reserve_inventory(**kwargs):
     order_id = kwargs["order_id"]
     # ... reserve items in warehouse ...
@@ -78,8 +76,7 @@ def release_inventory(compensation_data):
     print(f"Released reservation {compensation_data['reservation_id']}")
 
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def send_confirmation_email(**kwargs):
     order_id = kwargs["order_id"]
     transaction_id = kwargs["transaction_id"]

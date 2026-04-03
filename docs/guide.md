@@ -50,7 +50,7 @@ Key ideas:
 
 ```python
 from celery import Celery
-from celery_saga import Saga, StepResponse, saga_step, set_default_backend
+from celery_saga import Saga, StepResponse, saga_task, set_default_backend
 from celery_saga.backends import RedisSagaBackend
 
 app = Celery("myapp", broker="redis://localhost:6379/0")
@@ -61,8 +61,7 @@ set_default_backend(RedisSagaBackend(url="redis://localhost:6379/1"))
 
 # ── Define steps ──
 
-@saga_step(compensate="myapp.tasks.refund_payment")
-@app.task
+@saga_task(app, compensate="myapp.tasks.refund_payment")
 def charge_payment(**kwargs):
     txn = payment_service.charge(kwargs["order_id"], kwargs["amount"])
     return StepResponse(
@@ -93,15 +92,14 @@ print(output["transaction_id"])  # "txn-..."
 
 ## Defining Steps
 
-A saga step is a regular Celery task that optionally uses `@saga_step` to attach compensation metadata.
+A saga step is a regular Celery task with compensation metadata attached. You can define steps with either `@saga_task` (recommended — combines task registration and saga metadata) or `@saga_step` + `@app.task` (separate decorators).
 
 ### Step function signature
 
 Step tasks receive the **accumulated context** as keyword arguments. The context starts with the input passed to `saga.run()` and is enriched by each step's output.
 
 ```python
-@saga_step(compensate="myapp.tasks.undo_reservation")
-@app.task
+@saga_task(app, compensate="myapp.tasks.undo_reservation")
 def reserve_inventory(**kwargs):
     # kwargs contains all data from previous steps + original input
     order_id = kwargs["order_id"]
@@ -142,6 +140,41 @@ def send_email(**kwargs): ...
 Parameters:
 - `compensate` — string (task name) or task reference pointing to the compensation task
 - `no_compensation` — if `True`, this step is skipped during rollback (e.g., notifications)
+
+### @saga_task decorator
+
+Combined decorator that registers a Celery task **and** attaches saga metadata in one step. Accepts all `@app.task` keyword arguments (like `autoretry_for`, `max_retries`, etc.) alongside saga options.
+
+```python
+from celery_saga import saga_task
+
+@saga_task(app, compensate=refund_payment)
+def charge_payment(**kwargs):
+    ...
+
+@saga_task(app, no_compensation=True)
+def send_email(**kwargs):
+    ...
+
+# With Celery retry options
+@saga_task(
+    app,
+    compensate="myapp.tasks.refund",
+    bind=True,
+    autoretry_for=(ConnectionError, TimeoutError),
+    max_retries=3,
+    retry_backoff=True,
+)
+def charge_payment(self, **kwargs):
+    ...
+```
+
+Parameters:
+- `app` — the Celery application instance (positional)
+- `compensate` — string (task name) or task reference pointing to the compensation task
+- `no_compensation` — if `True`, this step is skipped during rollback
+- `name` — custom task name (defaults to the function's `__qualname__`)
+- `**task_kwargs` — any additional keyword arguments are forwarded to `@app.task()` (e.g., `bind`, `autoretry_for`, `max_retries`, `retry_backoff`, `queue`)
 
 ### Return values
 
@@ -406,8 +439,7 @@ Compensation tasks are retried up to 3 times by default. If compensation itself 
 Use `StepResponse.permanent_failure()` when a step has done **partial work** and needs to fail immediately (skipping Celery's retry mechanism) while passing cleanup data to the compensation function.
 
 ```python
-@saga_step(compensate="myapp.tasks.cleanup_records")
-@app.task
+@saga_task(app, compensate="myapp.tasks.cleanup_records")
 def process_batch(**kwargs):
     items = kwargs["items"]
     processed_ids = []
@@ -570,6 +602,27 @@ class PostgresSagaBackend(SagaBackend):
 
 Step retries are handled by **Celery's native retry mechanism** — celery-saga doesn't reinvent this.
 
+Using `@saga_task` (recommended — combines both decorators):
+
+```python
+@saga_task(
+    app,
+    compensate="myapp.tasks.refund",
+    bind=True,
+    autoretry_for=(ConnectionError, TimeoutError),
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=60,
+)
+def charge_payment(self, **kwargs):
+    return StepResponse(
+        output={"transaction_id": "txn-1"},
+        compensation_data={"transaction_id": "txn-1"},
+    )
+```
+
+Equivalent using separate decorators:
+
 ```python
 @saga_step(compensate="myapp.tasks.refund")
 @app.task(
@@ -650,6 +703,7 @@ def test_order_saga_compensates_on_failure():
 | `StepResponse` | class | Return value from a step |
 | `PermanentFailure` | exception | Raised by `StepResponse.permanent_failure()` |
 | `saga_step` | decorator | Attach compensation metadata to a task |
+| `saga_task` | decorator | Combined Celery task + saga metadata registration |
 | `SagaResult` | class | Handle to a running/completed saga |
 | `SagaCompensated` | exception | Raised when a saga was rolled back |
 | `SagaFailed` | exception | Raised when compensation failed |

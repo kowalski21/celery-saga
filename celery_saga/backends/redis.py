@@ -61,3 +61,21 @@ class RedisSagaBackend(SagaBackend):
         if isinstance(saga_id, bytes):
             saga_id = saga_id.decode()
         return self.load(saga_id)
+
+    def list_all(self) -> list[SagaExecution]:
+        results = []
+        idem_prefix = f"{self.PREFIX}idem:"
+        cursor = 0
+        while True:
+            cursor, keys = self._client.scan(cursor, match=f"{self.PREFIX}*", count=100)
+            for key in keys:
+                key_str = key.decode() if isinstance(key, bytes) else key
+                if key_str.startswith(idem_prefix):
+                    continue
+                data = self._client.get(key)
+                if data:
+                    results.append(SagaExecution.from_dict(json.loads(data)))
+            if cursor == 0:
+                break
+        results.sort(key=lambda e: e.created_at, reverse=True)
+        return results

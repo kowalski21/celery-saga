@@ -19,12 +19,11 @@ Real-world use cases for celery-saga.
 The classic saga example. An order involves payment, inventory, shipping, and notifications — each managed by a different service.
 
 ```python
-from celery_saga import Saga, StepResponse, saga_step
+from celery_saga import Saga, StepResponse, saga_task
 
 # ── Steps ──
 
-@saga_step(compensate="orders.tasks.refund_payment")
-@app.task
+@saga_task(app, compensate="orders.tasks.refund_payment")
 def charge_payment(**kwargs):
     txn = stripe.PaymentIntent.create(
         amount=kwargs["amount_cents"],
@@ -42,8 +41,7 @@ def refund_payment(compensation_data):
     stripe.Refund.create(payment_intent=compensation_data["payment_intent_id"])
 
 
-@saga_step(compensate="orders.tasks.release_inventory")
-@app.task
+@saga_task(app, compensate="orders.tasks.release_inventory")
 def reserve_inventory(**kwargs):
     reservation = inventory_service.reserve(
         order_id=kwargs["order_id"],
@@ -63,8 +61,7 @@ def release_inventory(compensation_data):
     inventory_service.release(compensation_data["reservation_id"])
 
 
-@saga_step(compensate="orders.tasks.cancel_shipment")
-@app.task
+@saga_task(app, compensate="orders.tasks.cancel_shipment")
 def create_shipment(**kwargs):
     shipment = shipping_service.create(
         order_id=kwargs["order_id"],
@@ -82,8 +79,7 @@ def cancel_shipment(compensation_data):
     shipping_service.cancel(compensation_data["shipment_id"])
 
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def send_order_confirmation(**kwargs):
     email_service.send(
         to=kwargs["customer_email"],
@@ -129,9 +125,9 @@ def create_order(request):
 Register a user across your database, email provider, and analytics platform. If any integration fails, clean up the others.
 
 ```python
-from celery_saga import Saga, StepResponse, saga_step
+from celery_saga import Saga, StepResponse, saga_task
 
-@saga_step(compensate="users.tasks.delete_user_record")
+@saga_task(app, compensate="users.tasks.delete_user_record")
 @app.task
 def create_user_record(**kwargs):
     user = db.users.create(
@@ -149,8 +145,7 @@ def delete_user_record(compensation_data):
     db.users.delete(compensation_data["user_id"])
 
 
-@saga_step(compensate="users.tasks.remove_from_mailchimp")
-@app.task
+@saga_task(app, compensate="users.tasks.remove_from_mailchimp")
 def add_to_email_list(**kwargs):
     subscriber = mailchimp.lists.add_member(
         list_id=MAIN_LIST_ID,
@@ -168,8 +163,7 @@ def remove_from_mailchimp(compensation_data):
     mailchimp.lists.remove_member(MAIN_LIST_ID, compensation_data["subscriber_id"])
 
 
-@saga_step(compensate="users.tasks.delete_analytics_user")
-@app.task
+@saga_task(app, compensate="users.tasks.delete_analytics_user")
 def create_analytics_profile(**kwargs):
     segment.identify(
         user_id=kwargs["user_id"],
@@ -186,8 +180,7 @@ def delete_analytics_user(compensation_data):
     segment.delete(user_id=compensation_data["user_id"])
 
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def send_welcome_email(**kwargs):
     email_service.send(to=kwargs["email"], template="welcome")
 
@@ -211,10 +204,9 @@ registration_saga = (
 Debit one account and credit another. The classic distributed transaction.
 
 ```python
-from celery_saga import Saga, StepResponse, saga_step
+from celery_saga import Saga, StepResponse, saga_task
 
-@saga_step(compensate="transfers.tasks.reverse_debit")
-@app.task
+@saga_task(app, compensate="transfers.tasks.reverse_debit")
 def debit_source_account(**kwargs):
     ledger.debit(
         account_id=kwargs["from_account"],
@@ -240,8 +232,7 @@ def reverse_debit(compensation_data):
     )
 
 
-@saga_step(compensate="transfers.tasks.reverse_credit")
-@app.task
+@saga_task(app, compensate="transfers.tasks.reverse_credit")
 def credit_destination_account(**kwargs):
     ledger.credit(
         account_id=kwargs["to_account"],
@@ -267,8 +258,7 @@ def reverse_credit(compensation_data):
     )
 
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def record_transfer(**kwargs):
     db.transfers.update(
         transfer_id=kwargs["transfer_id"],
@@ -302,10 +292,9 @@ result = transfer_saga.run(
 Process a list of items. If processing fails partway through, clean up only the items that were already processed using `permanent_failure`.
 
 ```python
-from celery_saga import Saga, StepResponse, saga_step, PermanentFailure
+from celery_saga import Saga, StepResponse, saga_task, PermanentFailure
 
-@saga_step(compensate="etl.tasks.delete_imported_records")
-@app.task
+@saga_task(app, compensate="etl.tasks.delete_imported_records")
 def import_records(**kwargs):
     records = kwargs["records"]
     imported_ids = []
@@ -333,8 +322,7 @@ def delete_imported_records(compensation_data):
         db.imports.delete(record_id)
 
 
-@saga_step(compensate="etl.tasks.unindex_records")
-@app.task
+@saga_task(app, compensate="etl.tasks.unindex_records")
 def index_in_elasticsearch(**kwargs):
     es.bulk_index("imports", kwargs["imported_ids"])
     return StepResponse(
@@ -348,8 +336,7 @@ def unindex_records(compensation_data):
     es.bulk_delete("imports", compensation_data["imported_ids"])
 
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def notify_completion(**kwargs):
     slack.post(f"Imported {kwargs['count']} records successfully.")
 
@@ -371,10 +358,9 @@ import_saga = (
 Book a flight, hotel, and car rental. All three must succeed or all are cancelled.
 
 ```python
-from celery_saga import Saga, StepResponse, saga_step
+from celery_saga import Saga, StepResponse, saga_task
 
-@saga_step(compensate="bookings.tasks.cancel_flight")
-@app.task
+@saga_task(app, compensate="bookings.tasks.cancel_flight")
 def book_flight(**kwargs):
     booking = airline_api.book(
         origin=kwargs["origin"],
@@ -396,8 +382,7 @@ def cancel_flight(compensation_data):
     airline_api.cancel(compensation_data["confirmation_code"])
 
 
-@saga_step(compensate="bookings.tasks.cancel_hotel")
-@app.task
+@saga_task(app, compensate="bookings.tasks.cancel_hotel")
 def book_hotel(**kwargs):
     booking = hotel_api.reserve(
         city=kwargs["destination"],
@@ -419,8 +404,7 @@ def cancel_hotel(compensation_data):
     hotel_api.cancel(compensation_data["confirmation_code"])
 
 
-@saga_step(compensate="bookings.tasks.cancel_car")
-@app.task
+@saga_task(app, compensate="bookings.tasks.cancel_car")
 def book_rental_car(**kwargs):
     booking = car_api.reserve(
         city=kwargs["destination"],
@@ -442,8 +426,7 @@ def cancel_car(compensation_data):
     car_api.cancel(compensation_data["confirmation_code"])
 
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def send_itinerary(**kwargs):
     total = kwargs["flight_price"] + kwargs["hotel_price"] + kwargs["car_price"]
     email_service.send(
@@ -484,10 +467,9 @@ result = travel_saga.run(
 Extract data from a source, transform it, load it into a warehouse. If loading fails, clean up the staging artifacts.
 
 ```python
-from celery_saga import Saga, StepResponse, saga_step
+from celery_saga import Saga, StepResponse, saga_task
 
-@saga_step(compensate="pipeline.tasks.delete_staging_file")
-@app.task
+@saga_task(app, compensate="pipeline.tasks.delete_staging_file")
 def extract_to_staging(**kwargs):
     path = s3.extract(
         source=kwargs["source_table"],
@@ -505,8 +487,7 @@ def delete_staging_file(compensation_data):
     s3.delete_prefix(STAGING_BUCKET, compensation_data["staging_path"])
 
 
-@saga_step(compensate="pipeline.tasks.drop_temp_table")
-@app.task
+@saga_task(app, compensate="pipeline.tasks.drop_temp_table")
 def transform_and_stage(**kwargs):
     temp_table = f"tmp_{kwargs['pipeline_run_id']}"
     warehouse.execute(f"""
@@ -525,8 +506,7 @@ def drop_temp_table(compensation_data):
     warehouse.execute(f"DROP TABLE IF EXISTS {compensation_data['temp_table']}")
 
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def swap_into_production(**kwargs):
     warehouse.execute(f"""
         BEGIN;
@@ -537,8 +517,7 @@ def swap_into_production(**kwargs):
     return StepResponse(output={"loaded": True})
 
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def cleanup_staging(**kwargs):
     s3.delete_prefix(STAGING_BUCKET, kwargs["staging_path"])
 
@@ -561,10 +540,9 @@ etl_saga = (
 Upgrade a user's subscription: update the billing, provision new features, notify the user. Uses `add_transform` to convert pricing.
 
 ```python
-from celery_saga import Saga, StepResponse, saga_step
+from celery_saga import Saga, StepResponse, saga_task
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def validate_upgrade(**kwargs):
     user = db.users.get(kwargs["user_id"])
     plan = db.plans.get(kwargs["new_plan_id"])
@@ -581,8 +559,7 @@ def validate_upgrade(**kwargs):
     })
 
 
-@saga_step(compensate="billing.tasks.revert_subscription")
-@app.task
+@saga_task(app, compensate="billing.tasks.revert_subscription")
 def update_billing(**kwargs):
     subscription = stripe.Subscription.modify(
         kwargs["stripe_subscription_id"],
@@ -606,8 +583,7 @@ def revert_subscription(compensation_data):
     )
 
 
-@saga_step(compensate="billing.tasks.revert_plan_record")
-@app.task
+@saga_task(app, compensate="billing.tasks.revert_plan_record")
 def update_plan_record(**kwargs):
     db.users.update(kwargs["user_id"], plan_id=kwargs["new_plan_id"])
     return StepResponse(
@@ -627,8 +603,7 @@ def revert_plan_record(compensation_data):
     )
 
 
-@saga_step(compensate="billing.tasks.revoke_features")
-@app.task
+@saga_task(app, compensate="billing.tasks.revoke_features")
 def provision_features(**kwargs):
     features = feature_service.provision(
         user_id=kwargs["user_id"],
@@ -651,8 +626,7 @@ def revoke_features(compensation_data):
     )
 
 
-@saga_step(no_compensation=True)
-@app.task
+@saga_task(app, no_compensation=True)
 def notify_upgrade(**kwargs):
     email_service.send(
         to=kwargs["user_email"],
