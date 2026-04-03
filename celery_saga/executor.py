@@ -15,7 +15,7 @@ from celery_saga.state import (
     StepExecution,
     StepStatus,
 )
-from celery_saga.step import PermanentFailure, StepResponse
+from celery_saga.step import PermanentFailure, StepResponse, _deserialize_compensation_data
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +228,10 @@ def saga_run_step(self, saga_id: str, step_index: int):
         step_input = dict(execution.context)
 
     try:
-        result = task.apply(kwargs=step_input).get()
+        eager_result = task.apply(kwargs=step_input)
+        if eager_result.failed():
+            eager_result.maybe_throw()
+        result = eager_result.result
 
         # Handle StepResponse
         if isinstance(result, StepResponse):
@@ -372,7 +375,10 @@ def saga_run_compensation(self, saga_id: str, step_index: int):
         raise RuntimeError(f"Compensation task {step_exec.compensation_task_name} not found")
 
     try:
-        comp_task.apply(args=(step_exec.compensation_data,)).get()
+        comp_data = _deserialize_compensation_data(step_exec.compensation_data, comp_task)
+        comp_result = comp_task.apply(args=(comp_data,))
+        if comp_result.failed():
+            comp_result.maybe_throw()
         step_exec.status = StepStatus.COMPENSATED
         execution.touch()
         backend.save(execution)

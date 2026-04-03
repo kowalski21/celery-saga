@@ -1,7 +1,40 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+
+def _is_pydantic_model(obj) -> bool:
+    """Check if an object is a Pydantic BaseModel instance without importing Pydantic."""
+    return hasattr(obj, "model_dump") and hasattr(obj, "model_fields")
+
+
+def _serialize_if_model(data: Any) -> Any:
+    """Convert Pydantic models to dicts for JSON serialization. Pass through everything else."""
+    if data is not None and _is_pydantic_model(data):
+        return data.model_dump()
+    return data
+
+
+def _get_compensation_type(task) -> type | None:
+    """Extract the type annotation for 'compensation_data' from a compensation task."""
+    fn = task.run if hasattr(task, "run") else task
+    hints = getattr(fn, "__annotations__", {})
+    comp_type = hints.get("compensation_data")
+    if comp_type is not None and hasattr(comp_type, "model_validate"):
+        return comp_type
+    return None
+
+
+def _deserialize_compensation_data(data: Any, task) -> Any:
+    """Deserialize compensation data into a Pydantic model if the task has type annotations."""
+    if data is None or not isinstance(data, dict):
+        return data
+    comp_type = _get_compensation_type(task)
+    if comp_type is not None:
+        return comp_type.model_validate(data)
+    return data
 
 
 class PermanentFailure(Exception):
@@ -9,7 +42,7 @@ class PermanentFailure(Exception):
 
     def __init__(self, message: str, compensation_data: Any = None):
         super().__init__(message)
-        self.compensation_data = compensation_data
+        self.compensation_data = _serialize_if_model(compensation_data)
 
 
 class StepResponse:
@@ -17,11 +50,15 @@ class StepResponse:
 
     Separates forward output (passed to next steps) from compensation data
     (passed to the compensation function on rollback).
+
+    Accepts Pydantic models — they are automatically serialized to dicts
+    for storage/transport and deserialized back when passed to the compensation function.
     """
 
     def __init__(self, output: Any = None, compensation_data: Any = None):
-        self.output = output
-        self.compensation_data = compensation_data if compensation_data is not None else output
+        self.output = _serialize_if_model(output)
+        comp = compensation_data if compensation_data is not None else output
+        self.compensation_data = _serialize_if_model(comp)
 
     @staticmethod
     def permanent_failure(message: str, compensation_data: Any = None):
@@ -45,15 +82,28 @@ class SagaStepMeta:
     no_compensation: bool = False
 
 
+def _resolve_compensate_name(compensate: str | Callable | None) -> str | None:
+    """Resolve a compensate reference to a task name string."""
+    if compensate is None:
+        return None
+    if isinstance(compensate, str):
+        return compensate
+    if hasattr(compensate, "name"):
+        return compensate.name
+    return getattr(compensate, "__name__", str(compensate))
+
+
 def saga_step(
     compensate: str | Callable | None = None,
     no_compensation: bool = False,
 ):
     """Decorator to attach saga metadata to a Celery task.
 
-    @saga_step(compensate="refund_payment")
-    @app.task(bind=True)
-    def charge_payment(self, order_id, amount):
+    Accepts both string task names and direct callable/task references for compensate.
+
+    @saga_step(compensate=refund_payment)
+    @app.task
+    def charge_payment(**kwargs):
         ...
     """
 
@@ -63,6 +113,39 @@ def saga_step(
             no_compensation=no_compensation,
         ))
         return fn
+
+    return decorator
+
+
+def saga_task(
+    app,
+    *,
+    compensate: str | Callable | None = None,
+    no_compensation: bool = False,
+    name: str | None = None,
+    **task_kwargs,
+):
+    """Combined decorator: registers a Celery task with saga step metadata.
+
+    @saga_task(app, compensate=refund_payment)
+    def charge_payment(**kwargs):
+        ...
+
+    Equivalent to:
+        @saga_step(compensate=refund_payment)
+        @app.task(name="charge_payment")
+        def charge_payment(**kwargs):
+            ...
+    """
+
+    def decorator(fn):
+        task_name = name or fn.__qualname__
+        celery_task = app.task(name=task_name, **task_kwargs)(fn)
+        setattr(celery_task, SAGA_STEP_ATTR, SagaStepMeta(
+            compensate=compensate,
+            no_compensation=no_compensation,
+        ))
+        return celery_task
 
     return decorator
 
