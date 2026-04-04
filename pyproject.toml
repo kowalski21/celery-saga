@@ -7,7 +7,9 @@ name = "celery-saga"
 version = "0.1.0"
 description = "Saga pattern for Celery with automatic compensation"
 requires-python = ">=3.10"
+readme = "README.md"
 license = "MIT"
+authors = [{ name = "Douglas Amoo-Sargon" }]
 keywords = ["celery", "saga", "distributed", "transactions", "compensation", "workflow"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -26,9 +28,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kowalski/celery-saga"
-Repository = "https://github.com/kowalski/celery-saga"
-Issues = "https://github.com/kowalski/celery-saga/issues"
+Homepage = "https://github.com/kowalski21/celery-saga"
+Repository = "https://github.com/kowalski21/celery-saga"
+Issues = "https://github.com/kowalski21/celery-saga/issues"
 
 [project.optional-dependencies]
 redis = ["redis>=4.0.0"]
