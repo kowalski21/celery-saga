@@ -17,6 +17,8 @@ from celery_saga import (
     transform,
 )
 from celery_saga.backends.memory import MemorySagaBackend
+from celery_saga.executor import _resolve_step_input
+from celery_saga.state import SagaExecution, StepExecution
 
 # ── Test Celery App (eager mode) ──
 
@@ -314,6 +316,19 @@ class TestParallelSteps:
         assert "charge:tup-1:200" in side_effects
         assert "reserve:tup-1" in side_effects
 
+    def test_functional_parallelize_records_parallel_group(self):
+        @saga("func_parallel_saga")
+        def my_saga(input):
+            order = step(validate_order, input)
+            payment = step(charge_payment, order)
+            inventory = step(reserve_inventory, order)
+            parallelize(payment, inventory)
+            step(send_confirmation, payment)
+
+        descriptors = my_saga.plan.flatten()
+        assert descriptors[1]["parallel_group"] == descriptors[2]["parallel_group"]
+        assert descriptors[1]["parallel_group"] is not None
+
 
 # ── Tests: Transform ──
 
@@ -327,6 +342,13 @@ def charge_in_cents(**kwargs):
         output={"transaction_id": f"txn-{order_id}", "amount_cents": amount_cents},
         compensation_data={"transaction_id": f"txn-{order_id}", "amount_cents": amount_cents},
     )
+
+
+@app.task
+def record_amount(**kwargs):
+    amount = kwargs.get("amount")
+    side_effects.append(f"amount_seen:{amount}")
+    return StepResponse(output={"seen_amount": amount})
 
 
 class TestTransform:
@@ -365,6 +387,57 @@ class TestTransform:
 
         assert result.status == SagaStatus.COMPLETED
         assert "charge_cents:ifn-1:2999" in side_effects
+
+    def test_builder_transform_applies_once(self):
+        order_saga = (
+            Saga("transform_once_saga", backend=backend)
+            .add_step(validate_order)
+            .add_transform(lambda ctx: {**ctx, "amount": ctx["amount"] + 1})
+            .add_step(record_amount, no_compensation=True)
+            .add_step(record_amount, no_compensation=True)
+        )
+
+        result = order_saga.run(order_id="tr-once", amount=10)
+        result.get(timeout=5)
+
+        assert side_effects.count("amount_seen:11") == 2
+
+    def test_functional_transform_serializes_for_worker_execution(self):
+        @saga("func_transform_saga")
+        def my_saga(input):
+            order = step(validate_order, input)
+            cents = transform(
+                order,
+                lambda data: {
+                    "order_id": data["order_id"],
+                    "amount_cents": int(data["amount"] * 100),
+                },
+            )
+            step(charge_in_cents, cents, no_compensation=True)
+
+        descriptors = my_saga.plan.flatten()
+        charge_desc = descriptors[1]
+        execution = SagaExecution(
+            saga_id="worker-like-transform",
+            saga_name="func_transform_saga",
+            context={"order_id": "fx-1", "amount": 29.99},
+            steps=[
+                StepExecution(
+                    step_index=0,
+                    task_name=descriptors[0]["task_name"],
+                    output={"order_id": "fx-1", "amount": 29.99},
+                ),
+                StepExecution(
+                    step_index=1,
+                    task_name=charge_desc["task_name"],
+                    input_spec=charge_desc["input_spec"],
+                    input_mapper=charge_desc["input_mapper"],
+                ),
+            ],
+        )
+
+        resolved = _resolve_step_input(execution, execution.steps[1])
+        assert resolved == {"order_id": "fx-1", "amount_cents": 2999}
 
 
 # ── Tests: Permanent Failure with Compensation Data ──

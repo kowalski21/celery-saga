@@ -317,9 +317,11 @@ combined = transform((order, payment), lambda o, p: {**o, **p})
 Runs multiple steps concurrently.
 
 ```python
-payment, inventory = parallelize(
-    step(charge_payment, order),
-    step(reserve_inventory, order),
+payment = step(charge_payment, order)
+inventory = step(reserve_inventory, order)
+parallelize(
+    payment,
+    inventory,
 )
 ```
 

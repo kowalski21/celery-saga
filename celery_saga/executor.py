@@ -8,7 +8,7 @@ from celery import shared_task, current_app, group, chain, chord
 
 from celery_saga.backends.base import SagaBackend
 from celery_saga.backends.memory import MemorySagaBackend
-from celery_saga.core import SagaPlan, ParallelRef, StepRef
+from celery_saga.core import SagaPlan, deserialize_callable
 from celery_saga.result import SagaResult
 from celery_saga.state import (
     SagaExecution,
@@ -22,11 +22,6 @@ logger = logging.getLogger(__name__)
 
 # Module-level default backend (can be overridden)
 _default_backend: SagaBackend | None = None
-
-# Registry for callable transforms/input_fns (not serializable, so stored in-process)
-# Key: saga_id, Value: {"transforms": [...], "input_fns": {step_index: fn}}
-_saga_registry: dict[str, dict] = {}
-
 
 def get_backend(backend=None) -> SagaBackend:
     global _default_backend
@@ -72,6 +67,8 @@ def execute_saga(
             compensation_task_name=desc["compensate_task_name"],
             no_compensation=desc["no_compensation"],
             parallel_group=desc["parallel_group"],
+            input_spec=desc.get("input_spec"),
+            input_mapper=desc.get("input_mapper"),
         ))
 
     execution = SagaExecution(
@@ -82,19 +79,9 @@ def execute_saga(
         input_data=input_data,
         context=dict(input_data),
         steps=step_executions,
+        transforms=transforms or [],
     )
     backend.save(execution)
-
-    # Store callable transforms and input_fns in registry
-    input_fns = {}
-    for desc in descriptors:
-        if desc.get("input_fn"):
-            input_fns[desc["step_index"]] = desc["input_fn"]
-
-    _saga_registry[saga_id] = {
-        "transforms": transforms or [],
-        "input_fns": input_fns,
-    }
 
     # Build the Celery task chain
     task_options = {}
@@ -213,21 +200,8 @@ def saga_run_step(self, saga_id: str, step_index: int):
     execution.touch()
     backend.save(execution)
 
-    # Resolve input — apply transforms and input_fns
-    registry = _saga_registry.get(saga_id, {})
-
-    # Apply any global transforms that come before this step
-    for transform_before_index, transform_fn in registry.get("transforms", []):
-        if transform_before_index <= step_index:
-            execution.context = transform_fn(execution.context)
-            backend.save(execution)
-
-    # Apply per-step input mapper, or use full context
-    input_fn = registry.get("input_fns", {}).get(step_index)
-    if input_fn:
-        step_input = input_fn(execution.context)
-    else:
-        step_input = dict(execution.context)
+    _apply_pending_transforms(execution, step_index, backend)
+    step_input = _resolve_step_input(execution, step_exec)
 
     try:
         eager_result = task.apply(kwargs=step_input)
@@ -431,3 +405,76 @@ def _find_step(execution: SagaExecution, step_index: int) -> StepExecution:
         if s.step_index == step_index:
             return s
     raise RuntimeError(f"Step {step_index} not found in saga {execution.saga_id}")
+
+
+def _apply_pending_transforms(
+    execution: SagaExecution,
+    step_index: int,
+    backend: SagaBackend,
+) -> None:
+    applied_indexes = set(execution.applied_transform_indexes)
+    changed = False
+
+    for transform_index, transform_entry in enumerate(execution.transforms):
+        before_step_index = transform_entry["before_step_index"]
+        if transform_index in applied_indexes or before_step_index > step_index:
+            continue
+
+        transform_fn = deserialize_callable(transform_entry["callable"])
+        execution.context = transform_fn(dict(execution.context))
+        execution.applied_transform_indexes.append(transform_index)
+        changed = True
+
+    if changed:
+        backend.save(execution)
+
+
+def _resolve_step_input(execution: SagaExecution, step_exec: StepExecution) -> dict[str, Any]:
+    input_mapper = deserialize_callable(step_exec.input_mapper)
+    if input_mapper:
+        return input_mapper(dict(execution.context))
+
+    if step_exec.input_spec is None:
+        return dict(execution.context)
+
+    resolved = _resolve_input_spec(execution, step_exec.input_spec)
+    if isinstance(resolved, dict):
+        return resolved
+    if resolved is None:
+        return {}
+    return {"result": resolved}
+
+
+def _resolve_input_spec(execution: SagaExecution, spec: dict[str, Any]) -> Any:
+    spec_type = spec["type"]
+
+    if spec_type == "literal":
+        return spec["value"]
+
+    if spec_type == "context":
+        return dict(execution.context)
+
+    if spec_type == "step":
+        return dict(execution.context)
+
+    if spec_type == "step_output":
+        step_output = _find_step(execution, spec["step_index"]).output
+        return dict(step_output or {})
+
+    if spec_type == "transform":
+        resolved_sources = [
+            _resolve_input_spec(execution, source_spec)
+            for source_spec in spec["sources"]
+        ]
+        transform_fn = deserialize_callable(spec["callable"])
+        if transform_fn is None:
+            merged = {}
+            for source in resolved_sources:
+                if isinstance(source, dict):
+                    merged.update(source)
+            return merged
+        if len(resolved_sources) == 1:
+            return transform_fn(resolved_sources[0])
+        return transform_fn(*resolved_sources)
+
+    raise ValueError(f"Unsupported input spec type: {spec_type}")

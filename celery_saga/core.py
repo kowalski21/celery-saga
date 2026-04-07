@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import base64
+import importlib
+import marshal
+import pickle
+import types
 import uuid
 from typing import Any, Callable
 
@@ -15,6 +20,73 @@ from celery_saga.step import (
 
 _current_plan: list | None = None
 _step_counter: int = 0
+
+
+def serialize_callable(fn: Callable | None) -> dict[str, Any] | None:
+    if fn is None:
+        return None
+
+    module_name = getattr(fn, "__module__", None)
+    qualname = getattr(fn, "__qualname__", None)
+    if module_name and qualname and "<locals>" not in qualname and "<lambda>" not in qualname:
+        try:
+            current = importlib.import_module(module_name)
+            for attr in qualname.split("."):
+                current = getattr(current, attr)
+            if current is fn:
+                return {
+                    "type": "import",
+                    "module": module_name,
+                    "qualname": qualname,
+                }
+        except Exception:
+            pass
+
+    if fn.__closure__:
+        raise ValueError("Cannot serialize callables with closures for distributed execution")
+
+    globals_payload = {}
+    for name in fn.__code__.co_names:
+        if name in fn.__globals__ and name != "__builtins__":
+            value = fn.__globals__[name]
+            try:
+                pickle.dumps(value)
+            except Exception:
+                continue
+            globals_payload[name] = value
+
+    return {
+        "type": "code",
+        "name": fn.__name__,
+        "code": base64.b64encode(marshal.dumps(fn.__code__)).decode("ascii"),
+        "defaults": base64.b64encode(pickle.dumps(fn.__defaults__)).decode("ascii"),
+        "kwdefaults": base64.b64encode(pickle.dumps(fn.__kwdefaults__)).decode("ascii"),
+        "globals": base64.b64encode(pickle.dumps(globals_payload)).decode("ascii"),
+    }
+
+
+def deserialize_callable(payload: dict[str, Any] | None) -> Callable | None:
+    if payload is None:
+        return None
+
+    payload_type = payload["type"]
+    if payload_type == "import":
+        current = importlib.import_module(payload["module"])
+        for attr in payload["qualname"].split("."):
+            current = getattr(current, attr)
+        return current
+
+    if payload_type == "code":
+        code = marshal.loads(base64.b64decode(payload["code"].encode("ascii")))
+        defaults = pickle.loads(base64.b64decode(payload["defaults"].encode("ascii")))
+        kwdefaults = pickle.loads(base64.b64decode(payload["kwdefaults"].encode("ascii")))
+        globals_payload = pickle.loads(base64.b64decode(payload["globals"].encode("ascii")))
+        namespace = {"__builtins__": __builtins__, **globals_payload}
+        fn = types.FunctionType(code, namespace, payload["name"], defaults)
+        fn.__kwdefaults__ = kwdefaults
+        return fn
+
+    raise ValueError(f"Unsupported callable payload type: {payload_type}")
 
 
 def _get_step_meta(task) -> SagaStepMeta:
@@ -87,7 +159,46 @@ def parallelize(*step_refs: StepRef) -> ParallelRef:
             step(reserve_inventory, order),
         )
     """
-    return ParallelRef(refs=list(step_refs))
+    ref = ParallelRef(refs=list(step_refs))
+
+    if _current_plan is not None:
+        _current_plan[:] = [
+            entry for entry in _current_plan
+            if not (isinstance(entry, StepRef) and entry in step_refs)
+        ]
+        _current_plan.append(ref)
+
+    return ref
+
+
+def _serialize_input_ref(
+    input_ref: StepRef | TransformRef | dict | None,
+    *,
+    for_transform_source: bool = False,
+) -> dict[str, Any] | None:
+    if input_ref is None:
+        return None
+
+    if isinstance(input_ref, StepRef):
+        ref_type = "step_output" if for_transform_source else "step"
+        return {"type": ref_type, "step_index": input_ref.step_index}
+
+    if isinstance(input_ref, TransformRef):
+        return {
+            "type": "transform",
+            "sources": [
+                _serialize_input_ref(source, for_transform_source=True)
+                for source in input_ref.sources
+            ],
+            "callable": serialize_callable(input_ref.transform_fn),
+        }
+
+    if isinstance(input_ref, dict):
+        if not input_ref:
+            return {"type": "context"}
+        return {"type": "literal", "value": input_ref}
+
+    raise TypeError(f"Unsupported input reference: {type(input_ref)!r}")
 
 
 # ── Saga class: built via @saga decorator or Saga builder ──
@@ -127,11 +238,6 @@ class SagaPlan:
             else:
                 comp_name = getattr(ref.compensate, "__name__", str(ref.compensate))
 
-        # Resolve input mapping function
-        input_fn = ref.input_fn
-        if input_fn is None and isinstance(ref.input_ref, TransformRef):
-            input_fn = ref.input_ref.transform_fn
-
         return {
             "step_index": ref.step_index,
             "task_name": ref.task.name if hasattr(ref.task, "name") else ref.task.__name__,
@@ -140,7 +246,8 @@ class SagaPlan:
             "compensate_task": ref.compensate if not isinstance(ref.compensate, str) else None,
             "no_compensation": ref.no_compensation,
             "parallel_group": parallel_group,
-            "input_fn": input_fn,
+            "input_spec": _serialize_input_ref(ref.input_ref),
+            "input_mapper": serialize_callable(ref.input_fn),
         }
 
 
@@ -253,7 +360,13 @@ class Saga:
             backend=self._backend,
             idempotency_key=idempotency_key,
             queue=queue,
-            transforms=self._transforms,
+            transforms=[
+                {
+                    "before_step_index": before_step_index,
+                    "callable": serialize_callable(transform_fn),
+                }
+                for before_step_index, transform_fn in self._transforms
+            ],
         )
 
     @property

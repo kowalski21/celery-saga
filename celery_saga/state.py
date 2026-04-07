@@ -38,6 +38,8 @@ class StepExecution:
     no_compensation: bool = False
     error: str | None = None
     parallel_group: int | None = None
+    input_spec: dict[str, Any] | None = None
+    input_mapper: dict[str, Any] | None = None
     started_at: str | None = None
     completed_at: str | None = None
 
@@ -54,6 +56,8 @@ class StepExecution:
             "no_compensation": self.no_compensation,
             "error": self.error,
             "parallel_group": self.parallel_group,
+            "input_spec": self.input_spec,
+            "input_mapper": self.input_mapper,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
         }
@@ -74,6 +78,8 @@ class SagaExecution:
     input_data: dict[str, Any] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict)
     steps: list[StepExecution] = field(default_factory=list)
+    transforms: list[dict[str, Any]] = field(default_factory=list)
+    applied_transform_indexes: list[int] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -89,6 +95,8 @@ class SagaExecution:
             "input_data": self.input_data,
             "context": self.context,
             "steps": [s.to_dict() for s in self.steps],
+            "transforms": self.transforms,
+            "applied_transform_indexes": self.applied_transform_indexes,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -98,4 +106,6 @@ class SagaExecution:
         data = data.copy()
         data["status"] = SagaStatus(data["status"])
         data["steps"] = [StepExecution.from_dict(s) for s in data["steps"]]
+        data.setdefault("transforms", [])
+        data.setdefault("applied_transform_indexes", [])
         return cls(**data)
