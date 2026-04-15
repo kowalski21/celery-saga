@@ -9,3 +9,20 @@ build/
 .tox/
 .venv/
 venv/
+
+# dotenv / secrets
+.env
+.env.*
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# tooling caches / reports
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.log
