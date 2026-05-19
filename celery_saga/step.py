@@ -57,8 +57,7 @@ class StepResponse:
 
     def __init__(self, output: Any = None, compensation_data: Any = None):
         self.output = _serialize_if_model(output)
-        comp = compensation_data if compensation_data is not None else output
-        self.compensation_data = _serialize_if_model(comp)
+        self.compensation_data = _serialize_if_model(compensation_data)
 
     @staticmethod
     def permanent_failure(message: str, compensation_data: Any = None):

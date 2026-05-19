@@ -1,12 +1,57 @@
 from __future__ import annotations
 
 import base64
+import hmac
+import hashlib
 import importlib
 import marshal
+import os
 import pickle
 import types
 import uuid
 from typing import Any, Callable
+
+# ── Signing for "code" payloads ──
+# Code payloads embed marshal/pickle blobs that execute arbitrary code on
+# deserialization. To prevent RCE when the backend (e.g. Redis) is shared or
+# untrusted, every code payload is HMAC-signed at serialize time and verified at
+# deserialize time. Set CELERY_SAGA_SIGNING_KEY in the environment (same value on
+# every process) to use lambdas / local functions in sagas. Otherwise use
+# module-level functions (serialized as "import" payloads — no code embedded).
+
+_SIGNING_KEY_ENV = "CELERY_SAGA_SIGNING_KEY"
+
+
+def _get_signing_key() -> bytes | None:
+    key = os.environ.get(_SIGNING_KEY_ENV)
+    return key.encode("utf-8") if key else None
+
+
+def _sign_code_payload(parts: dict[str, str]) -> str:
+    key = _get_signing_key()
+    if key is None:
+        raise RuntimeError(
+            f"Cannot serialize non-importable callable: {_SIGNING_KEY_ENV} is not set. "
+            "Either set this env var to an HMAC secret (must match on every worker), "
+            "or define the callable at module scope so it can be serialized as an import reference."
+        )
+    msg = "|".join(parts[k] for k in ("name", "code", "defaults", "kwdefaults", "globals"))
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _verify_code_payload(payload: dict[str, Any]) -> None:
+    key = _get_signing_key()
+    if key is None:
+        raise RuntimeError(
+            f"Refusing to deserialize signed code payload: {_SIGNING_KEY_ENV} is not set."
+        )
+    sig = payload.get("sig")
+    if not sig:
+        raise RuntimeError("Refusing to deserialize unsigned code payload (possible tampering).")
+    msg = "|".join(payload[k] for k in ("name", "code", "defaults", "kwdefaults", "globals"))
+    expected = hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        raise RuntimeError("Code payload HMAC verification failed (possible tampering).")
 
 from celery_saga.step import (
     SAGA_STEP_ATTR,
@@ -55,13 +100,17 @@ def serialize_callable(fn: Callable | None) -> dict[str, Any] | None:
                 continue
             globals_payload[name] = value
 
-    return {
-        "type": "code",
+    parts = {
         "name": fn.__name__,
         "code": base64.b64encode(marshal.dumps(fn.__code__)).decode("ascii"),
         "defaults": base64.b64encode(pickle.dumps(fn.__defaults__)).decode("ascii"),
         "kwdefaults": base64.b64encode(pickle.dumps(fn.__kwdefaults__)).decode("ascii"),
         "globals": base64.b64encode(pickle.dumps(globals_payload)).decode("ascii"),
+    }
+    return {
+        "type": "code",
+        **parts,
+        "sig": _sign_code_payload(parts),
     }
 
 
@@ -77,6 +126,7 @@ def deserialize_callable(payload: dict[str, Any] | None) -> Callable | None:
         return current
 
     if payload_type == "code":
+        _verify_code_payload(payload)
         code = marshal.loads(base64.b64decode(payload["code"].encode("ascii")))
         defaults = pickle.loads(base64.b64decode(payload["defaults"].encode("ascii")))
         kwdefaults = pickle.loads(base64.b64decode(payload["kwdefaults"].encode("ascii")))

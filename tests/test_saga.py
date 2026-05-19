@@ -163,9 +163,10 @@ class TestStepResponse:
         assert resp.output == {"id": 1}
         assert resp.compensation_data == {"id": 1, "extra": True}
 
-    def test_compensation_data_defaults_to_output(self):
+    def test_compensation_data_defaults_to_none(self):
+        # Compensation must be opt-in — output is not silently aliased.
         resp = StepResponse(output={"id": 1})
-        assert resp.compensation_data == {"id": 1}
+        assert resp.compensation_data is None
 
     def test_permanent_failure(self):
         from celery_saga.step import PermanentFailure

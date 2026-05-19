@@ -204,10 +204,14 @@ def saga_run_step(self, saga_id: str, step_index: int):
     step_input = _resolve_step_input(execution, step_exec)
 
     try:
-        eager_result = task.apply(kwargs=step_input)
-        if eager_result.failed():
-            eager_result.maybe_throw()
-        result = eager_result.result
+        if current_app.conf.task_always_eager:
+            async_result = task.apply(kwargs=step_input)
+            if async_result.failed():
+                async_result.maybe_throw()
+            result = async_result.result
+        else:
+            async_result = task.apply_async(kwargs=step_input)
+            result = async_result.get(disable_sync_subtasks=False, propagate=True)
 
         # Handle StepResponse
         if isinstance(result, StepResponse):
@@ -215,10 +219,10 @@ def saga_run_step(self, saga_id: str, step_index: int):
             compensation_data = result.compensation_data
         elif isinstance(result, dict):
             output = result
-            compensation_data = result
+            compensation_data = None
         else:
             output = {"result": result} if result is not None else {}
-            compensation_data = result
+            compensation_data = None
 
         # Update step
         step_exec.status = StepStatus.SUCCESS
@@ -292,14 +296,19 @@ def saga_on_error(self, saga_id: str):
     logger.info("Saga %s (%s) compensating...", saga_id, execution.saga_name)
 
     # Collect steps that need compensation, in reverse order.
-    # Include: successful steps AND failed steps with compensation_data (from PermanentFailure)
+    # Include: successful steps; failed/running steps with compensation_data (from
+    # PermanentFailure or from a worker crash mid-step where the side effect may
+    # have already executed).
     steps_to_compensate = [
         s for s in reversed(execution.steps)
         if not s.no_compensation
         and s.compensation_task_name
         and (
             s.status == StepStatus.SUCCESS
-            or (s.status == StepStatus.FAILED and s.compensation_data is not None)
+            or (
+                s.status in (StepStatus.FAILED, StepStatus.RUNNING)
+                and s.compensation_data is not None
+            )
         )
     ]
 
@@ -355,9 +364,12 @@ def saga_run_compensation(self, saga_id: str, step_index: int):
 
     try:
         comp_data = _deserialize_compensation_data(step_exec.compensation_data, comp_task)
-        comp_result = comp_task.apply(args=(comp_data,))
-        if comp_result.failed():
-            comp_result.maybe_throw()
+        if current_app.conf.task_always_eager:
+            comp_result = comp_task.apply(args=(comp_data,))
+            if comp_result.failed():
+                comp_result.maybe_throw()
+        else:
+            comp_task.apply_async(args=(comp_data,)).get(disable_sync_subtasks=False, propagate=True)
         step_exec.status = StepStatus.COMPENSATED
         execution.touch()
         backend.save(execution)
@@ -454,10 +466,7 @@ def _resolve_input_spec(execution: SagaExecution, spec: dict[str, Any]) -> Any:
     if spec_type == "context":
         return dict(execution.context)
 
-    if spec_type == "step":
-        return dict(execution.context)
-
-    if spec_type == "step_output":
+    if spec_type == "step" or spec_type == "step_output":
         step_output = _find_step(execution, spec["step_index"]).output
         return dict(step_output or {})
 
