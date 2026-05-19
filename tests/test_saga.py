@@ -613,3 +613,154 @@ class TestEdgeCases:
         assert comp_effects[0].startswith("undo_ship:")
         assert comp_effects[1].startswith("release:")
         assert comp_effects[2].startswith("refund:")
+
+
+# ── Tests: Atomic Child Saga ──
+
+
+@saga_step(compensate="tests.test_saga.undo_child_payment")
+@app.task
+def child_charge(**kwargs):
+    side_effects.append(f"child_charge:{kwargs.get('order_id')}:{kwargs.get('amount')}")
+    return StepResponse(
+        output={"child_txn": f"ctxn-{kwargs.get('order_id')}"},
+        compensation_data={"child_txn": f"ctxn-{kwargs.get('order_id')}"},
+    )
+
+
+@app.task
+def undo_child_payment(compensation_data):
+    side_effects.append(f"undo_child_charge:{compensation_data['child_txn']}")
+
+
+@saga_step(compensate="tests.test_saga.undo_child_inventory")
+@app.task
+def child_reserve(**kwargs):
+    side_effects.append(f"child_reserve:{kwargs.get('order_id')}")
+    return StepResponse(
+        output={"child_res": f"cres-{kwargs.get('order_id')}"},
+        compensation_data={"child_res": f"cres-{kwargs.get('order_id')}"},
+    )
+
+
+@app.task
+def undo_child_inventory(compensation_data):
+    side_effects.append(f"undo_child_reserve:{compensation_data['child_res']}")
+
+
+@saga_step(no_compensation=True)
+@app.task
+def child_fails(**kwargs):
+    side_effects.append("child_fails:boom")
+    raise ValueError("boom inside child")
+
+
+@app.task
+def undo_payment_saga(compensation_data):
+    # Parent-level compensation for a successful child saga.
+    side_effects.append(f"undo_payment_saga:{compensation_data['child_saga_id']}")
+
+
+@app.task
+def parent_step_fails(**kwargs):
+    side_effects.append("parent_step:fail")
+    raise ValueError("parent step failed")
+
+
+class TestChildSaga:
+    def test_child_completes_inside_parent(self):
+        payment_saga = (
+            Saga("payment_saga_a", backend=backend)
+            .add_step(child_charge)
+            .add_step(child_reserve)
+        )
+
+        parent = (
+            Saga("parent_a", backend=backend)
+            .add_step(validate_order)
+            .add_child(payment_saga, compensate=undo_payment_saga)
+        )
+
+        result = parent.run(order_id="cs-1", amount=42)
+        result.get(timeout=5)
+
+        assert result.status == SagaStatus.COMPLETED
+        assert "validate:cs-1" in side_effects
+        assert "child_charge:cs-1:42" in side_effects
+        assert "child_reserve:cs-1" in side_effects
+
+    def test_child_self_compensates_then_parent_rolls_back_earlier_steps(self):
+        # Payment saga: charge succeeds, then a step fails → child compensates
+        # itself (undoing the charge). Parent should NOT call undo_payment_saga
+        # (the child handled it), but should still compensate validate_order.
+        # validate_order has no_compensation=True, so we use a step that does.
+
+        payment_saga = (
+            Saga("payment_saga_b", backend=backend)
+            .add_step(child_charge)
+            .add_step(child_fails)
+        )
+
+        parent = (
+            Saga("parent_b", backend=backend)
+            .add_step(charge_payment)
+            .add_child(payment_saga, compensate=undo_payment_saga)
+        )
+
+        result = parent.run(order_id="cs-2", amount=99)
+
+        with pytest.raises(SagaCompensated):
+            result.get(timeout=5)
+
+        # Child self-cleaned its own charge
+        assert "undo_child_charge:ctxn-cs-2" in side_effects
+        # Parent's compensate for the child step was NOT called
+        assert not any(s.startswith("undo_payment_saga:") for s in side_effects)
+        # Earlier parent step WAS compensated
+        assert "refund:txn-cs-2:99" in side_effects
+
+    def test_child_succeeds_then_parent_fails_invokes_user_compensate(self):
+        payment_saga = (
+            Saga("payment_saga_c", backend=backend)
+            .add_step(child_charge)
+        )
+
+        parent = (
+            Saga("parent_c", backend=backend)
+            .add_step(validate_order)
+            .add_child(payment_saga, compensate=undo_payment_saga)
+            .add_step(parent_step_fails)
+        )
+
+        result = parent.run(order_id="cs-3", amount=50)
+
+        with pytest.raises(SagaCompensated):
+            result.get(timeout=5)
+
+        # Child succeeded → user's compensate for the child step runs
+        assert any(s.startswith("undo_payment_saga:") for s in side_effects)
+        # The child's own state should be COMPLETED (parent didn't touch its internals)
+        # Find the child saga via idempotency
+        child_exec = backend.find_by_idempotency_key(
+            f"{result.saga_id}:child:1"
+        )
+        assert child_exec is not None
+        assert child_exec.status == SagaStatus.COMPLETED
+
+    def test_child_via_as_step_in_functional_saga(self):
+        payment_saga = (
+            Saga("payment_saga_d", backend=backend)
+            .add_step(child_charge)
+        )
+
+        @saga("parent_d")
+        def parent_d(input):
+            order = validate_order(input)
+            payment_saga.as_step(order, compensate=undo_payment_saga)
+
+        parent_d._backend = backend
+        result = parent_d.run(order_id="cs-4", amount=7)
+        result.get(timeout=5)
+
+        assert result.status == SagaStatus.COMPLETED
+        assert "child_charge:cs-4:7" in side_effects

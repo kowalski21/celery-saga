@@ -45,6 +45,22 @@ class PermanentFailure(Exception):
         self.compensation_data = _serialize_if_model(compensation_data)
 
 
+class ChildSagaCompensated(PermanentFailure):
+    """Raised inside a child-saga step when the child rolled itself back.
+
+    The child saga already executed its own per-step compensations, so the
+    parent should treat this step as failed but skip the user-supplied
+    compensation for it. Earlier parent steps still compensate normally.
+    """
+
+    def __init__(self, child_saga_id: str, message: str = ""):
+        super().__init__(
+            message or f"Child saga {child_saga_id} self-compensated",
+            compensation_data=None,
+        )
+        self.child_saga_id = child_saga_id
+
+
 class StepResponse:
     """Return value from a saga step.
 
@@ -193,11 +209,14 @@ class StepRef:
     """
 
     step_index: int
-    task: Any  # Celery task
+    task: Any  # Celery task (None when this is a child-saga step)
     compensate: Any | None = None
     no_compensation: bool = False
     input_ref: Any = None  # StepRef | TransformRef | dict
     input_fn: Callable | None = None
+    # When set, this step runs the named child saga atomically instead of a
+    # Celery task. `task` is None in that case.
+    child_saga_name: str | None = None
 
 
 @dataclass

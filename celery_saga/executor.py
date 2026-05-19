@@ -16,7 +16,12 @@ from celery_saga.state import (
     StepExecution,
     StepStatus,
 )
-from celery_saga.step import PermanentFailure, StepResponse, _deserialize_compensation_data
+from celery_saga.step import (
+    ChildSagaCompensated,
+    PermanentFailure,
+    StepResponse,
+    _deserialize_compensation_data,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +74,7 @@ def execute_saga(
             parallel_group=desc["parallel_group"],
             input_spec=desc.get("input_spec"),
             input_mapper=desc.get("input_mapper"),
+            child_saga_name=desc.get("child_saga_name"),
         ))
 
     execution = SagaExecution(
@@ -188,6 +194,12 @@ def saga_run_step(self, saga_id: str, step_index: int):
 
     step_exec = _find_step(execution, step_index)
 
+    # Child-saga step: run the named child saga atomically. Branch here before
+    # any "Task not found" lookup, since child steps have no Celery task.
+    if step_exec.child_saga_name:
+        _run_child_saga_step(self, saga_id, execution, step_exec, backend)
+        return
+
     # Find the actual task
     task = current_app.tasks.get(step_exec.task_name)
     if not task:
@@ -256,6 +268,96 @@ def saga_run_step(self, saga_id: str, step_index: int):
         backend.save(execution)
         logger.error("Saga %s step %d (%s) failed: %s", saga_id, step_index, step_exec.task_name, e)
         raise
+
+
+def _run_child_saga_step(
+    parent_task,
+    parent_saga_id: str,
+    execution: SagaExecution,
+    step_exec: StepExecution,
+    backend: SagaBackend,
+) -> None:
+    """Atomically execute a child saga as a single step in the parent.
+
+    Outcomes:
+      - Child COMPLETED → step SUCCESS, output = child's final context,
+        compensation_data = {"child_saga_id": ...} for the user compensate task.
+      - Child COMPENSATED → step FAILED via ChildSagaCompensated; parent skips
+        compensation for THIS step (child already cleaned itself) but still
+        compensates earlier parent steps.
+      - Child FAILED (catastrophic) → step FAILED via generic exception;
+        parent's compensation chain runs as normal.
+    """
+    from celery_saga.core import _lookup_saga
+    from celery_saga.result import SagaCompensated, SagaFailed
+
+    step_exec.status = StepStatus.RUNNING
+    step_exec.started_at = datetime.now(timezone.utc).isoformat()
+    step_exec.task_id = parent_task.request.id
+    execution.touch()
+    backend.save(execution)
+
+    _apply_pending_transforms(execution, step_exec.step_index, backend)
+    child_input = _resolve_step_input(execution, step_exec)
+
+    import uuid as _uuid
+    from celery_saga.core import SagaPlan, serialize_callable
+
+    child_saga = _lookup_saga(step_exec.child_saga_name)
+    child_plan = SagaPlan(child_saga.name, child_saga._plan_entries)
+    child_saga_id = str(_uuid.uuid4())
+    idempotency_key = f"{parent_saga_id}:child:{step_exec.step_index}"
+
+    child_result = execute_saga(
+        saga_id=child_saga_id,
+        plan=child_plan,
+        input_data=child_input,
+        backend=backend,
+        idempotency_key=idempotency_key,
+        transforms=[
+            {
+                "before_step_index": before_step_index,
+                "callable": serialize_callable(transform_fn),
+            }
+            for before_step_index, transform_fn in child_saga._transforms
+        ],
+    )
+
+    try:
+        child_context = child_result.get(timeout=None, interval=0.2)
+    except SagaCompensated:
+        step_exec.status = StepStatus.FAILED
+        step_exec.completed_at = datetime.now(timezone.utc).isoformat()
+        step_exec.error = f"Child saga {step_exec.child_saga_name} self-compensated"
+        # Child already undid itself — suppress this step's compensation in the
+        # parent. Earlier parent steps still compensate.
+        step_exec.no_compensation = True
+        step_exec.compensation_data = None
+        step_exec.output = {"child_saga_id": child_result.saga_id}
+        execution.touch()
+        backend.save(execution)
+        raise ChildSagaCompensated(child_result.saga_id)
+    except SagaFailed as e:
+        step_exec.status = StepStatus.FAILED
+        step_exec.completed_at = datetime.now(timezone.utc).isoformat()
+        step_exec.error = f"Child saga {step_exec.child_saga_name} failed catastrophically: {e}"
+        execution.touch()
+        backend.save(execution)
+        raise
+
+    # Child completed successfully.
+    step_exec.status = StepStatus.SUCCESS
+    step_exec.completed_at = datetime.now(timezone.utc).isoformat()
+    step_exec.output = dict(child_context) if isinstance(child_context, dict) else {"result": child_context}
+    step_exec.compensation_data = {"child_saga_id": child_result.saga_id}
+    if isinstance(child_context, dict):
+        execution.context.update(child_context)
+    execution.touch()
+    backend.save(execution)
+    logger.info(
+        "Saga %s step %d ran child saga %s (id=%s) successfully",
+        parent_saga_id, step_exec.step_index, step_exec.child_saga_name, child_result.saga_id,
+    )
 
 
 @shared_task(name="celery_saga.parallel_done", bind=True, max_retries=0)

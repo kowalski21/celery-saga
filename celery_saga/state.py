@@ -42,6 +42,10 @@ class StepExecution:
     input_mapper: dict[str, Any] | None = None
     started_at: str | None = None
     completed_at: str | None = None
+    # Set when this step is a child saga (atomic-child model). The orchestrator
+    # looks the child saga up by name in the registry, runs it via execute_saga
+    # with parent-derived idempotency, and blocks on completion.
+    child_saga_name: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -60,12 +64,14 @@ class StepExecution:
             "input_mapper": self.input_mapper,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
+            "child_saga_name": self.child_saga_name,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> StepExecution:
         data = data.copy()
         data["status"] = StepStatus(data["status"])
+        data.setdefault("child_saga_name", None)
         return cls(**data)
 
 

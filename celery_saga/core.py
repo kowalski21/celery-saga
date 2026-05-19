@@ -61,6 +61,26 @@ from celery_saga.step import (
     TransformRef,
 )
 
+# ── Saga registry (used by atomic child-saga steps to look up children by name) ──
+# Sagas are looked up at execution time on the worker, so child saga modules must
+# be importable in every worker — same constraint as Celery tasks.
+
+_saga_registry: dict[str, "Saga"] = {}
+
+
+def _register_saga(s: "Saga") -> None:
+    _saga_registry[s.name] = s
+
+
+def _lookup_saga(name: str) -> "Saga":
+    if name not in _saga_registry:
+        raise RuntimeError(
+            f"Child saga {name!r} not found in registry. Make sure the module "
+            "defining it is imported on every worker."
+        )
+    return _saga_registry[name]
+
+
 # ── Plan-building context (set during @saga function evaluation) ──
 # A ContextVar — not a plain global — so concurrent saga definitions on different
 # threads/asyncio tasks don't stomp on each other, and so worker execution (which
@@ -339,16 +359,24 @@ class SagaPlan:
             else:
                 comp_name = getattr(ref.compensate, "__name__", str(ref.compensate))
 
+        if ref.child_saga_name is not None:
+            task_name = f"celery_saga.child:{ref.child_saga_name}"
+            task = None
+        else:
+            task_name = ref.task.name if hasattr(ref.task, "name") else ref.task.__name__
+            task = ref.task
+
         return {
             "step_index": ref.step_index,
-            "task_name": ref.task.name if hasattr(ref.task, "name") else ref.task.__name__,
-            "task": ref.task,
+            "task_name": task_name,
+            "task": task,
             "compensate_task_name": comp_name,
             "compensate_task": ref.compensate if not isinstance(ref.compensate, str) else None,
             "no_compensation": ref.no_compensation,
             "parallel_group": parallel_group,
             "input_spec": _serialize_input_ref(ref.input_ref),
             "input_mapper": serialize_callable(ref.input_fn),
+            "child_saga_name": ref.child_saga_name,
         }
 
 
@@ -377,6 +405,37 @@ class Saga:
         self._plan_entries: list = []
         self._transforms: list = []
         self._next_step_index: int = 0
+        _register_saga(self)
+
+    # ── Atomic child step ──
+
+    def as_step(
+        self,
+        input_ref: StepRef | TransformRef | dict | None = None,
+        *,
+        compensate: Any = None,
+    ) -> StepRef:
+        """Use this saga as a single step inside another saga.
+
+        The child runs to completion atomically. On child success, the parent's
+        step output is the child's final context. On child self-compensation,
+        the parent treats this step as failed without invoking `compensate`
+        (the child has already cleaned itself up) — earlier parent steps still
+        compensate. On child catastrophic failure, parent goes to FAILED.
+
+        Usage:
+            payment = payment_saga.as_step(order, compensate=undo_payment)
+        """
+        ref = StepRef(
+            step_index=_next_step_index(),
+            task=None,
+            compensate=compensate,
+            no_compensation=compensate is None,
+            input_ref=input_ref,
+            child_saga_name=self.name,
+        )
+        _append_to_plan(ref)
+        return ref
 
     # ── Builder API ──
 
@@ -432,6 +491,26 @@ class Saga:
             refs.append(ref)
 
         self._plan_entries.append(ParallelRef(refs=refs))
+        return self
+
+    def add_child(
+        self,
+        child_saga: Saga,
+        *,
+        compensate: Any = None,
+        input: Callable | None = None,
+    ) -> Saga:
+        """Add a child saga as an atomic step. See `Saga.as_step` for semantics."""
+        ref = StepRef(
+            step_index=self._next_step_index,
+            task=None,
+            compensate=compensate,
+            no_compensation=compensate is None,
+            input_fn=input,
+            child_saga_name=child_saga.name,
+        )
+        self._next_step_index += 1
+        self._plan_entries.append(ref)
         return self
 
     def add_transform(self, fn: Callable) -> Saga:

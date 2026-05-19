@@ -289,6 +289,49 @@ for step in execution.steps:
 
 ---
 
+## Example 7: nested sagas (atomic child model)
+
+A saga can be used as a single step inside another saga. The child runs to completion atomically.
+
+```python
+from celery_saga import Saga, saga
+
+payment_saga = (
+    Saga("payment")
+    .add_step(charge_payment)
+    .add_step(reserve_inventory)
+)
+
+# Functional form:
+@saga("checkout")
+def checkout_saga(input):
+    order = create_order(input)
+    payment_saga.as_step(order, compensate=undo_payment)
+    ship_order(order)
+
+# Builder form:
+checkout = (
+    Saga("checkout")
+    .add_step(create_order)
+    .add_child(payment_saga, compensate=undo_payment)
+    .add_step(ship_order)
+)
+```
+
+**Semantics:**
+
+- **Child completes** → parent step's output is the child's final context. If the parent later fails, your `compensate` task is called with `{"child_saga_id": "..."}` so you can undo the child as one unit.
+- **Child compensates itself** (a step inside the child failed and the child rolled itself back) → parent treats this step as failed but **does not** call your `compensate` for the child (it already cleaned itself up). Earlier parent steps still compensate.
+- **Child catastrophically fails** (child's own compensation broke) → parent goes to `SagaFailed`.
+
+**Constraints:**
+
+- The child saga module must be importable on every worker — it's looked up at execution time by name, not serialized across the wire.
+- A child saga consumes a worker thread for its entire duration (the parent step blocks on `child_result.get()`).
+- Idempotency key for the child is derived as `f"{parent_saga_id}:child:{step_index}"` automatically — parent retries won't double-run the child.
+
+---
+
 ## When NOT to use a saga
 
 - **Single-database transactions** — use a real DB transaction.
