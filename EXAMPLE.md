@@ -1,0 +1,291 @@
+# celery-saga by example
+
+A practical walkthrough of using `celery-saga` to build distributed transactions on Celery, with automatic compensation on failure.
+
+## What is a saga?
+
+A saga is a sequence of local transactions where each step has a **compensating action** that undoes it. If step 3 fails, sagas roll back by running the compensations for steps 2 and 1 in reverse order — restoring the system to a consistent state without needing a distributed lock.
+
+## Install
+
+```bash
+pip install celery-saga[redis]
+```
+
+Set an HMAC signing key for any saga that uses lambdas or locally-defined functions (required since v0.1+ for safe deserialization of code payloads from Redis):
+
+```bash
+export CELERY_SAGA_SIGNING_KEY="some-long-random-secret-shared-across-workers"
+```
+
+If you only use module-level (importable) functions in your saga, you can skip this — they are stored as import references, not code blobs.
+
+---
+
+## Example 1: order processing saga
+
+A canonical e-commerce flow: charge the customer, reserve inventory, send a confirmation. If anything fails midway, refund and release inventory.
+
+### `app.py`
+
+```python
+from celery import Celery
+from celery_saga import set_default_backend
+from celery_saga.backends import RedisSagaBackend
+
+app = Celery("shop", broker="redis://localhost:6379/0")
+app.conf.result_backend = "redis://localhost:6379/0"
+
+set_default_backend(RedisSagaBackend(url="redis://localhost:6379/1"))
+```
+
+### `tasks.py`
+
+```python
+from app import app
+from celery_saga import saga_task, StepResponse
+
+
+@saga_task(app, compensate="tasks.refund_payment")
+def charge_payment(**kwargs):
+    order_id = kwargs["order_id"]
+    amount = kwargs["amount"]
+    txn_id = payment_gateway.charge(order_id, amount)  # your code
+    return StepResponse(
+        output={"transaction_id": txn_id},
+        compensation_data={"transaction_id": txn_id, "amount": amount},
+    )
+
+
+@app.task
+def refund_payment(compensation_data):
+    payment_gateway.refund(
+        compensation_data["transaction_id"],
+        compensation_data["amount"],
+    )
+
+
+@saga_task(app, compensate="tasks.release_inventory")
+def reserve_inventory(**kwargs):
+    res_id = warehouse.reserve(kwargs["order_id"])
+    return StepResponse(
+        output={"reservation_id": res_id},
+        compensation_data={"reservation_id": res_id},
+    )
+
+
+@app.task
+def release_inventory(compensation_data):
+    warehouse.release(compensation_data["reservation_id"])
+
+
+@saga_task(app, no_compensation=True)
+def send_confirmation(**kwargs):
+    email.send(kwargs["order_id"], kwargs["transaction_id"])
+    return StepResponse(output={"email_sent": True})
+```
+
+Key things to notice:
+
+- `@saga_task(app, compensate=...)` registers a Celery task **and** marks its compensation.
+- `compensate=` accepts a string task name or a direct task reference.
+- `compensation_data` is **opt-in** — it is only saved if you explicitly return it. The output of a step is **not** silently used as compensation data.
+- `no_compensation=True` flags pure side-effects (emails, notifications) that can't be undone.
+
+### `run_saga.py`
+
+```python
+from celery_saga import Saga, SagaCompensated, SagaFailed
+from tasks import charge_payment, reserve_inventory, send_confirmation
+
+order_saga = (
+    Saga("order_saga")
+    .add_step(charge_payment)
+    .add_step(reserve_inventory)
+    .add_step(send_confirmation)
+)
+
+result = order_saga.run(order_id="order-42", amount=59.99)
+
+try:
+    output = result.get(timeout=30)
+    print("Order completed:", output)
+except SagaCompensated as e:
+    print("Order rolled back cleanly:", e)
+except SagaFailed as e:
+    print("Catastrophic failure — manual intervention needed:", e)
+```
+
+Start a worker:
+
+```bash
+celery -A app worker --loglevel=info
+```
+
+---
+
+## Example 2: parallel steps
+
+When two steps don't depend on each other, run them in parallel.
+
+```python
+from celery_saga import Saga
+
+booking_saga = (
+    Saga("booking")
+    .add_step(reserve_flight)
+    .add_parallel(
+        reserve_hotel,
+        reserve_car,
+    )
+    .add_step(charge_payment)
+)
+```
+
+`add_parallel` dispatches its tasks as a Celery `group`. If any branch fails, **all** previously successful steps — including parallel siblings — are compensated in reverse order.
+
+Pass `(task, compensate_task)` tuples when the compensation isn't already declared via `@saga_task`:
+
+```python
+.add_parallel(
+    (reserve_hotel, cancel_hotel),
+    (reserve_car, cancel_car),
+)
+```
+
+---
+
+## Example 3: passing data between steps (functional API)
+
+For pipelines where step N needs output from step N-1, use the `@saga` decorator with `step()` and `transform()`:
+
+```python
+from celery_saga import saga, step, transform
+
+@saga("checkout")
+def checkout_saga(input):
+    order = step(create_order, input)
+
+    # Transform order output into the shape charge_payment expects:
+    charge_input = transform(order, lambda o: {"amount": o["total"] * 100, "customer": o["customer_id"]})
+    payment = step(charge_payment, charge_input)
+
+    # Pass both order and payment into the final step:
+    combined = transform((order, payment), lambda o, p: {**o, **p})
+    step(ship_order, combined)
+
+
+result = checkout_saga.run(customer_id="cust-7", cart=[...])
+```
+
+A few things to know:
+
+- `step(task, ref)` declares "run `task` with `ref` as its input." `ref` can be another `StepRef`, a `TransformRef`, or a literal dict.
+- `transform(sources, fn)` runs `fn` on the resolved sources at execution time. Sources can be a single ref or a tuple.
+- Lambdas and local functions are serialized for distributed execution — this is why `CELERY_SAGA_SIGNING_KEY` is required.
+- The saga function runs **once at decoration time** with `{}` as input to build the plan. Don't put real I/O in it; just declare `step`/`transform` calls.
+
+---
+
+## Example 4: permanent failure with cleanup data
+
+Sometimes a step does partial work before discovering it can't finish. Raise `PermanentFailure` with the partial state so compensation can clean it up:
+
+```python
+from celery_saga import StepResponse, PermanentFailure
+
+@saga_task(app, compensate="tasks.delete_uploaded_files")
+def upload_batch(**kwargs):
+    uploaded = []
+    for file in kwargs["files"]:
+        try:
+            file_id = storage.upload(file)
+            uploaded.append(file_id)
+        except QuotaExceeded:
+            # We created `uploaded` files but can't finish — clean them up.
+            raise PermanentFailure(
+                "Quota exceeded mid-upload",
+                compensation_data={"file_ids": uploaded},
+            )
+    return StepResponse(output={"file_ids": uploaded}, compensation_data={"file_ids": uploaded})
+
+
+@app.task
+def delete_uploaded_files(compensation_data):
+    for fid in compensation_data["file_ids"]:
+        storage.delete(fid)
+```
+
+`PermanentFailure` skips retries and immediately triggers compensation — including for the step that raised it.
+
+---
+
+## Example 5: Pydantic models in compensation data
+
+Annotate the `compensation_data` parameter with a Pydantic model and `celery-saga` will serialize/deserialize automatically:
+
+```python
+from pydantic import BaseModel
+
+class PaymentRefund(BaseModel):
+    transaction_id: str
+    amount: float
+
+
+@saga_task(app, compensate="tasks.refund_payment")
+def charge_payment(**kwargs):
+    txn = PaymentRefund(transaction_id="txn-1", amount=kwargs["amount"])
+    return StepResponse(output={"transaction_id": txn.transaction_id}, compensation_data=txn)
+
+
+@app.task
+def refund_payment(compensation_data: PaymentRefund):
+    # compensation_data arrives as a PaymentRefund instance, not a dict
+    payment_gateway.refund(compensation_data.transaction_id, compensation_data.amount)
+```
+
+---
+
+## Example 6: idempotency
+
+Pass `idempotency_key=` to `run()` to dedupe accidental re-invocations:
+
+```python
+result = order_saga.run(
+    order_id="order-42",
+    amount=59.99,
+    idempotency_key="order-42",  # typically the request/order id
+)
+```
+
+If a saga with the same key is already `RUNNING` or `COMPLETED`, you get a handle to the existing run rather than a duplicate.
+
+---
+
+## Inspecting saga state
+
+```python
+from celery_saga import SagaResult, SagaStatus
+from app import default_backend  # whatever you passed to set_default_backend
+
+execution = default_backend.load(saga_id)
+print(execution.status)               # SagaStatus.COMPLETED | COMPENSATED | FAILED | ...
+for step in execution.steps:
+    print(step.task_name, step.status, step.output, step.error)
+```
+
+---
+
+## When NOT to use a saga
+
+- **Single-database transactions** — use a real DB transaction.
+- **Read-only workflows** — no compensation needed; a plain Celery chain is simpler.
+- **Steps that can't be compensated and can't be retried** — sagas only help if you have a meaningful undo.
+
+---
+
+## Operational notes
+
+- **Signing key**: any worker that runs a saga using lambdas must have the same `CELERY_SAGA_SIGNING_KEY` set, otherwise it will refuse to deserialize and the saga will fail.
+- **Compensation on worker crash**: if a worker is killed mid-step, the step's saved status is `RUNNING`. If you provided `compensation_data`, it will still be compensated on recovery — so always save compensation data eagerly for steps that have already produced side effects.
+- **Queue routing**: pass `queue=` to `.run()` to route saga orchestrator tasks to a specific queue. User task routing (`@app.task(queue=...)`) is honored independently.
