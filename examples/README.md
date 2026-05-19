@@ -7,7 +7,6 @@ in-memory backend so no broker or Redis is needed.
 
 ```bash
 pip install -e ..
-export CELERY_SAGA_SIGNING_KEY=examples-secret  # required for lambdas/transforms
 python 01_builder_api.py
 ```
 
@@ -16,6 +15,11 @@ Or all of them:
 ```bash
 for f in 0*.py; do echo "=== $f ==="; python "$f"; done
 ```
+
+> In production, set `CELERY_SAGA_SIGNING_KEY` to an HMAC secret shared by every
+> worker if your sagas use lambdas in `transform()` / `input_fn=`. In eager mode
+> (used by these examples and the test suite), the key is auto-supplied because
+> serialization never crosses a process boundary.
 
 ## What each one shows
 

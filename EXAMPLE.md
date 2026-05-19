@@ -12,13 +12,16 @@ A saga is a sequence of local transactions where each step has a **compensating 
 pip install celery-saga[redis]
 ```
 
-Set an HMAC signing key for any saga that uses lambdas or locally-defined functions (required since v0.1+ for safe deserialization of code payloads from Redis):
+In production, set an HMAC signing key for any saga that uses lambdas or locally-defined functions:
 
 ```bash
 export CELERY_SAGA_SIGNING_KEY="some-long-random-secret-shared-across-workers"
 ```
 
-If you only use module-level (importable) functions in your saga, you can skip this — they are stored as import references, not code blobs.
+This key signs `marshal`/`pickle` code payloads that are written to the backend, so a tampered Redis can't inject code on workers. Two ways to skip setting it:
+
+- Use only module-level (importable) functions in your saga — they're stored as import references, no signing needed.
+- Run with `task_always_eager=True` (tests, local dev) — eager mode never crosses a process boundary, so the library auto-supplies a sentinel key.
 
 ---
 

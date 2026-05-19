@@ -20,11 +20,28 @@ from typing import Any, Callable
 # module-level functions (serialized as "import" payloads — no code embedded).
 
 _SIGNING_KEY_ENV = "CELERY_SAGA_SIGNING_KEY"
+# In-process sentinel key used only when task_always_eager=True and no real key
+# is set. Eager mode runs in a single process, so the backend round-trip never
+# crosses a trust boundary — signing provides no protection there. The sentinel
+# keeps the sign/verify code path uniform without requiring dev-time config.
+_EAGER_MODE_SENTINEL_KEY = b"celery-saga:eager-mode-dev-only"
+
+
+def _is_eager_mode() -> bool:
+    try:
+        from celery import current_app
+        return bool(current_app.conf.task_always_eager)
+    except Exception:
+        return False
 
 
 def _get_signing_key() -> bytes | None:
     key = os.environ.get(_SIGNING_KEY_ENV)
-    return key.encode("utf-8") if key else None
+    if key:
+        return key.encode("utf-8")
+    if _is_eager_mode():
+        return _EAGER_MODE_SENTINEL_KEY
+    return None
 
 
 def _sign_code_payload(parts: dict[str, str]) -> str:
