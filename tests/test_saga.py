@@ -235,6 +235,55 @@ class TestFunctionalAPI:
         assert "refund:txn-func-2:75" in side_effects
 
 
+class TestAutoRegisterAPI:
+    """Calling saga-decorated tasks directly inside @saga registers them as steps."""
+
+    def test_direct_call_registers_step(self):
+        @saga("auto_saga")
+        def my_saga(input):
+            order = validate_order(input)
+            payment = charge_payment(order)
+            send_confirmation(payment)
+
+        my_saga._backend = backend
+        result = my_saga.run(order_id="auto-1", amount=10)
+        result.get(timeout=5)
+
+        assert result.status == SagaStatus.COMPLETED
+        assert "validate:auto-1" in side_effects
+        assert "charge:auto-1:10" in side_effects
+
+    def test_direct_call_triggers_compensation_on_failure(self):
+        @saga("auto_fail_saga")
+        def my_saga(input):
+            order = validate_order(input)
+            payment = charge_payment(order)
+            charge_payment_fails(payment)
+
+        my_saga._backend = backend
+        result = my_saga.run(order_id="auto-2", amount=22)
+
+        with pytest.raises(SagaCompensated):
+            result.get(timeout=5)
+
+        assert "refund:txn-auto-2:22" in side_effects
+
+    def test_direct_call_outside_saga_executes_normally(self):
+        # When NOT inside a @saga build context, calling the task must run it
+        # (eager mode here). The hook must pass through transparently.
+        side_effects.clear()
+        validate_order(order_id="direct-1")
+        assert "validate:direct-1" in side_effects
+
+    def test_mixing_args_and_kwargs_raises(self):
+        with pytest.raises(TypeError):
+
+            @saga("bad_saga")
+            def my_saga(input):
+                order = validate_order(input)
+                charge_payment(order, amount=5)  # mixed → error
+
+
 # ── Tests: Parallel Steps ──
 
 

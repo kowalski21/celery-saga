@@ -73,12 +73,40 @@ class StepResponse:
 
 
 SAGA_STEP_ATTR = "_saga_step_meta"
+SAGA_HOOK_INSTALLED_ATTR = "_saga_call_hook_installed"
 
 
 @dataclass
 class SagaStepMeta:
     compensate: str | Callable | None = None
     no_compensation: bool = False
+
+
+def _install_saga_call_hook(celery_task) -> None:
+    """Make this task auto-register as a saga step when called inside a @saga plan.
+
+    Celery's worker invocation goes through Task.__call__ which delegates to
+    self.run(). We wrap __call__ on the task's *class* so that direct calls like
+    `my_task(input)` inside an @saga function register a StepRef, while normal
+    worker execution (which never sets the plan ContextVar) passes through to
+    the original __call__ unchanged.
+    """
+    cls = type(celery_task)
+    if getattr(cls, SAGA_HOOK_INSTALLED_ATTR, False):
+        return
+
+    # Late import to avoid a circular dependency (core imports from step).
+    from celery_saga.core import _plan_active, auto_register_step
+
+    original_call = cls.__call__
+
+    def saga_aware_call(self, *args, **kwargs):
+        if _plan_active() and getattr(self, SAGA_STEP_ATTR, None) is not None:
+            return auto_register_step(self, args, kwargs)
+        return original_call(self, *args, **kwargs)
+
+    cls.__call__ = saga_aware_call
+    setattr(cls, SAGA_HOOK_INSTALLED_ATTR, True)
 
 
 def _resolve_compensate_name(compensate: str | Callable | None) -> str | None:
@@ -111,6 +139,10 @@ def saga_step(
             compensate=compensate,
             no_compensation=no_compensation,
         ))
+        # fn here is typically a Celery task instance (decorator order: @saga_step
+        # over @app.task). Install the call hook if so.
+        if hasattr(fn, "name") and hasattr(fn, "apply_async"):
+            _install_saga_call_hook(fn)
         return fn
 
     return decorator
@@ -144,6 +176,7 @@ def saga_task(
             compensate=compensate,
             no_compensation=no_compensation,
         ))
+        _install_saga_call_hook(celery_task)
         return celery_task
 
     return decorator

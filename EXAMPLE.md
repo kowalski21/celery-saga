@@ -157,22 +157,22 @@ Pass `(task, compensate_task)` tuples when the compensation isn't already declar
 
 ## Example 3: passing data between steps (functional API)
 
-For pipelines where step N needs output from step N-1, use the `@saga` decorator with `step()` and `transform()`:
+For pipelines where step N needs output from step N-1, use the `@saga` decorator. Tasks decorated with `@saga_task` / `@saga_step` auto-register as steps when you call them inside the saga function — no need to wrap each one in `step(...)`:
 
 ```python
-from celery_saga import saga, step, transform
+from celery_saga import saga, transform
 
 @saga("checkout")
 def checkout_saga(input):
-    order = step(create_order, input)
+    order = create_order(input)
 
     # Transform order output into the shape charge_payment expects:
     charge_input = transform(order, lambda o: {"amount": o["total"] * 100, "customer": o["customer_id"]})
-    payment = step(charge_payment, charge_input)
+    payment = charge_payment(charge_input)
 
     # Pass both order and payment into the final step:
     combined = transform((order, payment), lambda o, p: {**o, **p})
-    step(ship_order, combined)
+    ship_order(combined)
 
 
 result = checkout_saga.run(customer_id="cust-7", cart=[...])
@@ -180,10 +180,23 @@ result = checkout_saga.run(customer_id="cust-7", cart=[...])
 
 A few things to know:
 
-- `step(task, ref)` declares "run `task` with `ref` as its input." `ref` can be another `StepRef`, a `TransformRef`, or a literal dict.
+- Inside an `@saga` function, calling a `@saga_task`-decorated task **does not execute it** — it registers a `StepRef` placeholder in the plan. Outside this context (workers, tests, direct invocation) the same call runs normally.
+- The call accepts at most one positional argument (the input ref — a `StepRef`, `TransformRef`, or literal dict). Pure-literal inputs can be passed as kwargs: `create_order(customer_id="cust-7")`.
 - `transform(sources, fn)` runs `fn` on the resolved sources at execution time. Sources can be a single ref or a tuple.
 - Lambdas and local functions are serialized for distributed execution — this is why `CELERY_SAGA_SIGNING_KEY` is required.
-- The saga function runs **once at decoration time** with `{}` as input to build the plan. Don't put real I/O in it; just declare `step`/`transform` calls.
+- The saga function runs **once at decoration time** with `{}` as input to build the plan. Don't put real I/O in it; just declare step calls and transforms.
+
+If you prefer being explicit, the original `step()` form still works and is interoperable with the auto-registering form:
+
+```python
+from celery_saga import saga, step, transform
+
+@saga("checkout")
+def checkout_saga(input):
+    order = step(create_order, input)              # explicit
+    payment = charge_payment(order)                 # auto-registering
+    ship_order(transform((order, payment), merge))  # mixed is fine
+```
 
 ---
 

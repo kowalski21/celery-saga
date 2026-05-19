@@ -61,10 +61,35 @@ from celery_saga.step import (
     TransformRef,
 )
 
-# ── Module-level collector used during saga function definition ──
+# ── Plan-building context (set during @saga function evaluation) ──
+# A ContextVar — not a plain global — so concurrent saga definitions on different
+# threads/asyncio tasks don't stomp on each other, and so worker execution (which
+# never enters this context) cannot accidentally trigger auto-registration.
 
-_current_plan: list | None = None
-_step_counter: int = 0
+import contextvars
+
+_current_plan_var: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "celery_saga_current_plan", default=None
+)
+_step_counter_var: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "celery_saga_step_counter", default=0
+)
+
+
+def _plan_active() -> bool:
+    return _current_plan_var.get() is not None
+
+
+def _next_step_index() -> int:
+    idx = _step_counter_var.get()
+    _step_counter_var.set(idx + 1)
+    return idx
+
+
+def _append_to_plan(entry) -> None:
+    plan = _current_plan_var.get()
+    if plan is not None:
+        plan.append(entry)
 
 
 def serialize_callable(fn: Callable | None) -> dict[str, Any] | None:
@@ -162,26 +187,51 @@ def step(
         payment = step(charge_payment, order)
         step(charge_payment, order, compensate=refund_payment)
     """
-    global _step_counter
-
     meta = _get_step_meta(task)
-    comp = compensate or meta.compensate
+    comp = compensate if compensate is not None else meta.compensate
     no_comp = no_compensation or meta.no_compensation
 
     ref = StepRef(
-        step_index=_step_counter,
+        step_index=_next_step_index(),
         task=task,
         compensate=comp,
         no_compensation=no_comp,
         input_ref=input_ref,
         input_fn=input_fn,
     )
-    _step_counter += 1
-
-    if _current_plan is not None:
-        _current_plan.append(ref)
-
+    _append_to_plan(ref)
     return ref
+
+
+def auto_register_step(task, args: tuple, kwargs: dict) -> StepRef:
+    """Register a saga-decorated task call as a plan step.
+
+    Called by a task's __call__ hook when we're inside an active @saga plan
+    build. Supports three calling conventions:
+
+        task()                      → input_ref = None (use accumulated context)
+        task(ref)                   → input_ref = ref (StepRef | TransformRef | dict)
+        task(key=value, ...)        → input_ref = {...} (literal dict)
+    """
+    if args and kwargs:
+        raise TypeError(
+            f"{getattr(task, 'name', task)}: cannot mix a positional input ref with "
+            "keyword arguments inside a saga. Use transform() to combine sources."
+        )
+    if len(args) > 1:
+        raise TypeError(
+            f"{getattr(task, 'name', task)}: a saga step accepts at most one positional "
+            "argument (the input ref). Got {len(args)}."
+        )
+
+    if args:
+        input_ref = args[0]
+    elif kwargs:
+        input_ref = dict(kwargs)
+    else:
+        input_ref = None
+
+    return step(task, input_ref)
 
 
 def transform(
@@ -211,12 +261,13 @@ def parallelize(*step_refs: StepRef) -> ParallelRef:
     """
     ref = ParallelRef(refs=list(step_refs))
 
-    if _current_plan is not None:
-        _current_plan[:] = [
-            entry for entry in _current_plan
+    plan = _current_plan_var.get()
+    if plan is not None:
+        plan[:] = [
+            entry for entry in plan
             if not (isinstance(entry, StepRef) and entry in step_refs)
         ]
-        _current_plan.append(ref)
+        plan.append(ref)
 
     return ref
 
@@ -435,22 +486,18 @@ def saga(name: str, backend=None):
     """
 
     def decorator(fn: Callable) -> Saga:
-        global _current_plan, _step_counter
-
-        # Run the function once to collect the plan
-        _current_plan = []
-        _step_counter = 0
-
+        plan: list = []
+        plan_token = _current_plan_var.set(plan)
+        counter_token = _step_counter_var.set(0)
         try:
             # Pass a sentinel dict as input — the function builds the plan
             fn({})
         finally:
-            plan_entries = _current_plan
-            _current_plan = None
-            _step_counter = 0
+            _current_plan_var.reset(plan_token)
+            _step_counter_var.reset(counter_token)
 
         s = Saga(name, backend=backend)
-        s._plan_entries = plan_entries
+        s._plan_entries = plan
         return s
 
     return decorator
